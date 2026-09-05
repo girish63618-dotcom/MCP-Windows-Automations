@@ -1,116 +1,58 @@
-from dataclasses import dataclass,field
+from windows_mcp.tree.views import TreeState
+from dataclasses import dataclass
 from tabulate import tabulate
 from typing import Optional
+from PIL.Image import Image
+from enum import Enum
+
+class Browser(Enum):
+    CHROME='Chrome'
+    EDGE='Edge'
+    FIREFOX='Firefox'
+
+class Status(Enum):
+    MAXIMIZED='Maximized'
+    MINIMIZED='Minimized'
+    NORMAL='Normal'
+    HIDDEN='Hidden'
+
 
 @dataclass
-class DOMInfo:
-    horizontal_scrollable: bool
-    horizontal_scroll_percent: float
-    vertical_scrollable: bool
-    vertical_scroll_percent: float
-
-@dataclass
-class TreeState:
-    interactive_nodes:list['TreeElementNode']=field(default_factory=list)
-    scrollable_nodes:list['ScrollElementNode']=field(default_factory=list)
-    dom_informative_nodes:list['TextElementNode']=field(default_factory=list)
-    dom_info:Optional['DOMInfo']=None
-
-    def interactive_elements_to_string(self) -> str:
-        if not self.interactive_nodes:
-            return "No interactive elements"
-        headers = ["Label", "App Name", "ControlType", "Name", "Value", "Shortcut", "Coordinates" ,"IsFocused"]
-        rows = [node.to_row(idx) for idx, node in enumerate(self.interactive_nodes)]
-        return tabulate(rows, headers=headers, tablefmt="simple")
-
-    def scrollable_elements_to_string(self) -> str:
-        if not self.scrollable_nodes:
-            return "No scrollable elements"
-        headers = [
-            "Label", "App Name", "ControlType", "Name", "Coordinates",
-            "Horizontal Scrollable", "Horizontal Scroll Percent(%)", "Vertical Scrollable", "Vertical Scroll Percent(%)", "IsFocused"
-        ]
-        base_index = len(self.interactive_nodes)
-        rows = [node.to_row(idx, base_index) for idx, node in enumerate(self.scrollable_nodes)]
-        return tabulate(rows, headers=headers, tablefmt="simple")
+class App:
+    name:str
+    depth:int
+    status:Status
+    size:'Size'
+    handle: int
+    process_id:int
     
+    def to_row(self):
+        return [self.name, self.depth, self.status.value, self.size.width, self.size.height, self.handle]
+
 @dataclass
-class BoundingBox:
-    left:int
-    top:int
-    right:int
-    bottom:int
+class Size:
     width:int
     height:int
 
-    def get_center(self)->'Center':
-        return Center(x=self.left+self.width//2,y=self.top+self.height//2)
-
-    def xywh_to_string(self):
-        return f'({self.left},{self.top},{self.width},{self.height})'
-    
-    def xyxy_to_string(self):
-        x1,y1,x2,y2=self.convert_xywh_to_xyxy()
-        return f'({x1},{y1},{x2},{y2})'
-    
-    def convert_xywh_to_xyxy(self)->tuple[int,int,int,int]:
-        x1,y1=self.left,self.top
-        x2,y2=self.left+self.width,self.top+self.height
-        return x1,y1,x2,y2
+    def to_string(self):
+        return f'({self.width},{self.height})'
 
 @dataclass
-class Center:
-    x:int
-    y:int
+class DesktopState:
+    apps:list[App]
+    active_app:Optional[App]
+    screenshot:Image|None
+    tree_state:TreeState
 
-    def to_string(self)->str:
-        return f'({self.x},{self.y})'
+    def active_app_to_string(self):
+        if self.active_app is None:
+            return 'No active app found'
+        headers = ["Name", "Depth", "Status", "Width", "Height", "Handle"]
+        return tabulate([self.active_app.to_row()], headers=headers, tablefmt="simple")
 
-@dataclass
-class TreeElementNode:
-    name: str
-    control_type: str
-    app_name: str
-    value:str
-    shortcut: str
-    bounding_box: BoundingBox
-    center: Center
-    xpath:str
-    is_focused:bool
-
-    def to_row(self, index: int):
-        return [index, self.app_name, self.control_type, self.name, self.value, self.shortcut, self.center.to_string(),self.is_focused]
-
-@dataclass
-class ScrollElementNode:
-    name: str
-    control_type: str
-    xpath:str
-    app_name: str
-    bounding_box: BoundingBox
-    center: Center
-    horizontal_scrollable: bool
-    horizontal_scroll_percent: float
-    vertical_scrollable: bool
-    vertical_scroll_percent: float
-    is_focused: bool
-
-    def to_row(self, index: int, base_index: int):
-        return [
-            base_index + index,
-            self.app_name,
-            self.control_type,
-            self.name,
-            self.center.to_string(),
-            self.horizontal_scrollable,
-            self.horizontal_scroll_percent,
-            self.vertical_scrollable,
-            self.vertical_scroll_percent,
-            self.is_focused
-        ]
-
-@dataclass
-class TextElementNode:
-    text:str
-
-ElementNode=TreeElementNode|ScrollElementNode
+    def apps_to_string(self):
+        if not self.apps:
+            return 'No apps running in background'
+        headers = ["Name", "Depth", "Status", "Width", "Height", "Handle"]
+        rows = [app.to_row() for app in self.apps]
+        return tabulate(rows, headers=headers, tablefmt="simple")

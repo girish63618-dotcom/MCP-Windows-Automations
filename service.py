@@ -1,14 +1,26 @@
-from windows_mcp.tree.config import INTERACTIVE_CONTROL_TYPE_NAMES,DOCUMENT_CONTROL_TYPE_NAMES,INFORMATIVE_CONTROL_TYPE_NAMES, DEFAULT_ACTIONS, THREAD_MAX_RETRIES
-from windows_mcp.tree.views import TreeElementNode, ScrollElementNode, TextElementNode, Center, BoundingBox, TreeState, DOMInfo
-from uiautomation import Control,ImageControl,ScrollPattern,WindowControl,Rect,GetRootControl,PatternId
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from windows_mcp.tree.utils import random_point_within_bounding_box
-from PIL import Image, ImageFont, ImageDraw
-from typing import TYPE_CHECKING,Optional
-from windows_mcp.desktop.views import App
+from windows_mcp.desktop.config import BROWSER_NAMES, PROCESS_PER_MONITOR_DPI_AWARE
+from windows_mcp.desktop.views import DesktopState, App, Size, Status
+from windows_mcp.tree.service import Tree
+from locale import getpreferredencoding
+from contextlib import contextmanager
+from typing import Optional,Literal
+from markdownify import markdownify
+from fuzzywuzzy import process
+from psutil import Process
 from time import sleep
+from PIL import Image
+import win32process
+import subprocess
+import win32gui
+import win32con
+import requests
 import logging
-import random
+import base64
+import ctypes
+import csv
+import re
+import os
+import io
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -17,451 +29,430 @@ formatter = logging.Formatter('[%(levelname)s] %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-if TYPE_CHECKING:
-    from windows_mcp.desktop.service import Desktop
-    
-class Tree:
-    def __init__(self,desktop:'Desktop'):
-        self.desktop=desktop
-        self.screen_size=self.desktop.get_screen_size()
-        self.dom_info:Optional[DOMInfo]=None
-        self.dom_bounding_box:BoundingBox=None
-        self.screen_box=BoundingBox(
-            top=0, left=0, bottom=self.screen_size.height, right=self.screen_size.width,
-            width=self.screen_size.width, height=self.screen_size.height 
-        )
+try:  
+    ctypes.windll.shcore.SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)
+except Exception:  
+    ctypes.windll.user32.SetProcessDPIAware()  
 
-    def get_state(self,active_app:App,other_apps:list[App],use_dom:bool=False)->TreeState:
-        root=GetRootControl()
-        other_apps_handle=set(map(lambda other_app: other_app.handle,other_apps))
-        apps=list(filter(lambda app:app.NativeWindowHandle not in other_apps_handle,root.GetChildren()))
-        del other_apps_handle
-        if active_app:
-            apps=list(filter(lambda app:app.ClassName!='Progman',apps))
-        interactive_nodes,scrollable_nodes,dom_informative_nodes=self.get_appwise_nodes(apps=apps,use_dom=use_dom)
-        return TreeState(dom_info=self.dom_info,interactive_nodes=interactive_nodes,scrollable_nodes=scrollable_nodes,dom_informative_nodes=dom_informative_nodes)
+import uiautomation as uia
+import pyautogui as pg
 
-    def get_appwise_nodes(self,apps:list[Control],use_dom:bool=False)-> tuple[list[TreeElementNode],list[ScrollElementNode],list[TextElementNode]]:
-        interactive_nodes, scrollable_nodes,dom_informative_nodes = [], [], []
-        with ThreadPoolExecutor() as executor:
-            retry_counts = {app: 0 for app in apps}
-            future_to_app = {
-                executor.submit(
-                    self.get_nodes, app, 
-                    self.desktop.is_app_browser(app),
-                    use_dom
-                ): app 
-                for app in apps
-            }
-            while future_to_app:  # keep running until no pending futures
-                for future in as_completed(list(future_to_app)):
-                    app = future_to_app.pop(future)  # remove completed future
-                    try:
-                        result = future.result()
-                        if result:
-                            element_nodes, scroll_nodes,informative_nodes = result
-                            interactive_nodes.extend(element_nodes)
-                            scrollable_nodes.extend(scroll_nodes)
-                            dom_informative_nodes.extend(informative_nodes)
-                    except Exception as e:
-                        retry_counts[app] += 1
-                        logger.debug(f"Error in processing node {app.Name}, retry attempt {retry_counts[app]}\nError: {e}")
-                        if retry_counts[app] < THREAD_MAX_RETRIES:
-                            logger.debug(f"Retrying {app.Name} for the {retry_counts[app]}th time")
-                            new_future = executor.submit(self.get_nodes, app, self.desktop.is_app_browser(app),use_dom)
-                            future_to_app[new_future] = app
-                        else:
-                            logger.error(f"Task failed completely for {app.Name} after {THREAD_MAX_RETRIES} retries")
-        return interactive_nodes,scrollable_nodes,dom_informative_nodes
-    
-    def iou_bounding_box(self,window_box: Rect,element_box: Rect,) -> BoundingBox:
-        # Step 1: Intersection of element and window (existing logic)
-        intersection_left = max(window_box.left, element_box.left)
-        intersection_top = max(window_box.top, element_box.top)
-        intersection_right = min(window_box.right, element_box.right)
-        intersection_bottom = min(window_box.bottom, element_box.bottom)
+pg.FAILSAFE=False
+pg.PAUSE=1.0
 
-        # Step 2: Clamp to screen boundaries (new addition)
-        intersection_left = max(self.screen_box.left, intersection_left)
-        intersection_top = max(self.screen_box.top, intersection_top)
-        intersection_right = min(self.screen_box.right, intersection_right)
-        intersection_bottom = min(self.screen_box.bottom, intersection_bottom)
-
-        # Step 3: Validate intersection
-        if (intersection_right > intersection_left and intersection_bottom > intersection_top):
-            bounding_box = BoundingBox(
-                left=intersection_left,
-                top=intersection_top,
-                right=intersection_right,
-                bottom=intersection_bottom,
-                width=intersection_right - intersection_left,
-                height=intersection_bottom - intersection_top
-            )
+class Desktop:
+    def __init__(self):
+        self.encoding=getpreferredencoding()
+        self.tree=Tree(self)
+        self.desktop_state=None
+        
+    def get_resolution(self)->tuple[int,int]:
+        return pg.size()
+        
+    def get_state(self,use_vision:bool=False,use_dom:bool=False,as_bytes:bool=False,scale:float=1.0)->DesktopState:
+        sleep(0.1)
+        apps=self.get_apps()
+        active_app=self.get_active_app()
+        if active_app is not None and active_app in apps:
+            apps.remove(active_app)
+        logger.debug(f"Active app: {active_app}")
+        logger.debug(f"Apps: {apps}")
+        tree_state=self.tree.get_state(active_app,apps,use_dom=use_dom)
+        if use_vision:
+            screenshot=self.tree.get_annotated_screenshot(tree_state.interactive_nodes,scale=scale)
+            if as_bytes:
+                bytes_io=io.BytesIO()
+                screenshot.save(bytes_io,format='PNG')
+                screenshot=bytes_io.getvalue()
         else:
-            # No valid visible intersection (either outside window or screen)
-            bounding_box = BoundingBox(
-                left=0,
-                top=0,
-                right=0,
-                bottom=0,
-                width=0,
-                height=0
-            )
-        return bounding_box
-
-    def get_nodes(self, node: Control, is_browser:bool=False,use_dom:bool=False) -> tuple[list[TreeElementNode],list[ScrollElementNode]]:
-        window_bounding_box=node.BoundingRectangle
-
-        def is_element_visible(node:Control,threshold:int=0):
-            is_control=node.IsControlElement
-            box=node.BoundingRectangle
-            if box.isempty():
-                return False
-            width=box.width()
-            height=box.height()
-            area=width*height
-            is_offscreen=(not node.IsOffscreen) or node.ControlTypeName in ['EditControl']
-            return area > threshold and is_offscreen and is_control
+            screenshot=None
+        self.desktop_state=DesktopState(apps= apps,active_app=active_app,screenshot=screenshot,tree_state=tree_state)
+        return self.desktop_state
     
-        def is_element_enabled(node:Control):
-            try:
-                return node.IsEnabled
-            except Exception:
-                return False
-            
-        def is_default_action(node:Control):
-            legacy_pattern=node.GetLegacyIAccessiblePattern()
-            default_action=legacy_pattern.DefaultAction.title()
-            if default_action in DEFAULT_ACTIONS:
-                return True
-            return False
-        
-        def is_element_image(node:Control):
-            if isinstance(node,ImageControl):
-                if node.LocalizedControlType=='graphic' or not node.IsKeyboardFocusable:
-                    return True
-            return False
-        
-        def is_element_text(node:Control):
-            try:
-                if node.ControlTypeName in INFORMATIVE_CONTROL_TYPE_NAMES:
-                    if is_element_visible(node) and is_element_enabled(node) and not is_element_image(node):
-                        return True
-            except Exception:
-                return False
-            return False
-            
-        def is_window_modal(node:WindowControl):
-            try:
-                window_pattern=node.GetWindowPattern()
-                return window_pattern.IsModal
-            except Exception:
-                return False
-            
-        def is_keyboard_focusable(node:Control):
-            try:
-                if node.ControlTypeName in set(['EditControl','ButtonControl','CheckBoxControl','RadioButtonControl','TabItemControl']):
-                    return True
-                return node.IsKeyboardFocusable
-            except Exception:
-                return False
-            
-        def element_has_child_element(node:Control,control_type:str,child_control_type:str):
-            if node.LocalizedControlType==control_type:
-                first_child=node.GetFirstChildControl()
-                if first_child is None:
-                    return False
-                return first_child.LocalizedControlType==child_control_type
-            
-        def group_has_no_name(node:Control):
-            try:
-                if node.ControlTypeName=='GroupControl':
-                    if not node.Name.strip():
-                        return True
-                return False
-            except Exception:
-                return False
-            
-        def is_element_scrollable(node:Control):
-            try:
-                if (node.ControlTypeName in INTERACTIVE_CONTROL_TYPE_NAMES|INFORMATIVE_CONTROL_TYPE_NAMES) or node.IsOffscreen:
-                    return False
-                scroll_pattern:ScrollPattern=node.GetPattern(PatternId.ScrollPattern)
-                if scroll_pattern is None:
-                    return False
-                return scroll_pattern.VerticallyScrollable
-            except Exception:
-                return False
-            
-        def is_element_interactive(node:Control):
-            try:
-                if is_browser and node.ControlTypeName in set(['DataItemControl','ListItemControl']) and not is_keyboard_focusable(node):
-                    return False
-                elif not is_browser and node.ControlTypeName=="ImageControl" and is_keyboard_focusable(node):
-                    return True
-                elif node.ControlTypeName in INTERACTIVE_CONTROL_TYPE_NAMES|DOCUMENT_CONTROL_TYPE_NAMES:
-                    return is_element_visible(node) and is_element_enabled(node) and (not is_element_image(node) or is_keyboard_focusable(node))
-                elif node.ControlTypeName=='GroupControl':
-                    if is_browser:
-                        return is_element_visible(node) and is_element_enabled(node) and (is_default_action(node) or is_keyboard_focusable(node))
-                    # else:
-                    #     return is_element_visible and is_element_enabled(node) and is_default_action(node)
-            except Exception:
-                return False
-            return False
-        
-        def dom_correction(node:Control):
-            if element_has_child_element(node,'list item','link') or element_has_child_element(node,'item','link'):
-                dom_interactive_nodes.pop()
-                return None
-            elif node.ControlTypeName=='GroupControl':
-                dom_interactive_nodes.pop()
-                if is_keyboard_focusable(node):
-                    child=node
-                    try:
-                        while child.GetFirstChildControl() is not None:
-                            if child.ControlTypeName in INTERACTIVE_CONTROL_TYPE_NAMES:
-                                return None
-                            child=child.GetFirstChildControl()
-                    except Exception:
-                        return None
-                    if child.ControlTypeName!='TextControl':
-                        return None
-                    legacy_pattern=node.GetLegacyIAccessiblePattern()
-                    value=legacy_pattern.Value
-                    element_bounding_box = node.BoundingRectangle
-                    bounding_box=self.iou_bounding_box(self.dom_bounding_box,element_bounding_box)
-                    center = bounding_box.get_center()
-                    is_focused=node.HasKeyboardFocus
-                    dom_interactive_nodes.append(TreeElementNode(**{
-                        'name':child.Name.strip(),
-                        'control_type':node.LocalizedControlType,
-                        'value':value,
-                        'shortcut':node.AcceleratorKey,
-                        'bounding_box':bounding_box,
-                        'xpath':'',
-                        'center':center,
-                        'app_name':app_name,
-                        'is_focused':is_focused
-                    }))
-            elif element_has_child_element(node,'link','heading'):
-                dom_interactive_nodes.pop()
-                node=node.GetFirstChildControl()
-                control_type='link'
-                legacy_pattern=node.GetLegacyIAccessiblePattern()
-                value=legacy_pattern.Value
-                element_bounding_box = node.BoundingRectangle
-                bounding_box=self.iou_bounding_box(self.dom_bounding_box,element_bounding_box)
-                center = bounding_box.get_center()
-                is_focused=node.HasKeyboardFocus
-                dom_interactive_nodes.append(TreeElementNode(**{
-                    'name':node.Name.strip(),
-                    'control_type':control_type,
-                    'value':node.Name.strip(),
-                    'shortcut':node.AcceleratorKey,
-                    'bounding_box':bounding_box,
-                    'xpath':'',
-                    'center':center,
-                    'app_name':app_name,
-                    'is_focused':is_focused
-                }))
-            
-        def tree_traversal(node: Control,is_dom:bool=False,is_dialog:bool=False):
-            # Checks to skip the nodes that are not interactive
-            if node.IsOffscreen and (node.ControlTypeName not in set(["GroupControl","EditControl","TitleBarControl"])) and node.ClassName not in set(["Popup","Windows.UI.Core.CoreComponentInputSource"]):
-                return None
-            
-            if is_element_scrollable(node):
-                scroll_pattern:ScrollPattern=node.GetPattern(PatternId.ScrollPattern)
-                box = node.BoundingRectangle
-                # Get the center
-                x,y=random_point_within_bounding_box(node=node,scale_factor=0.8)
-                center = Center(x=x,y=y)
-                scrollable_nodes.append(ScrollElementNode(**{
-                    'name':node.Name.strip() or node.AutomationId or node.LocalizedControlType.capitalize() or "''",
-                    'app_name':app_name,
-                    'control_type':node.LocalizedControlType.title(),
-                    'bounding_box':BoundingBox(**{
-                        'left':box.left,
-                        'top':box.top,
-                        'right':box.right,
-                        'bottom':box.bottom,
-                        'width':box.width(),
-                        'height':box.height()
-                    }),
-                    'center':center,
-                    'xpath':'',
-                    'horizontal_scrollable':scroll_pattern.HorizontallyScrollable,
-                    'horizontal_scroll_percent':scroll_pattern.HorizontalScrollPercent if scroll_pattern.HorizontallyScrollable else 0,
-                    'vertical_scrollable':scroll_pattern.VerticallyScrollable,
-                    'vertical_scroll_percent':scroll_pattern.VerticalScrollPercent if scroll_pattern.VerticallyScrollable else 0,
-                    'is_focused':node.HasKeyboardFocus
-                }))
-                    
-            if is_element_interactive(node):
-                legacy_pattern=node.GetLegacyIAccessiblePattern()
-                value=legacy_pattern.Value.strip() if legacy_pattern.Value is not None else ""
-                is_focused=node.HasKeyboardFocus
-                name=node.Name.strip()
-                element_bounding_box = node.BoundingRectangle
-                if is_browser and is_dom:
-                    bounding_box=self.iou_bounding_box(self.dom_bounding_box,element_bounding_box)
-                    center = bounding_box.get_center()
-                    tree_node=TreeElementNode(**{
-                        'name':name,
-                        'control_type':node.LocalizedControlType.title(),
-                        'value':value,
-                        'shortcut':node.AcceleratorKey,
-                        'bounding_box':bounding_box,
-                        'center':center,
-                        'xpath':'',
-                        'app_name':app_name,
-                        'is_focused':is_focused
-                    })
-                    dom_interactive_nodes.append(tree_node)
-                    dom_correction(node=node)
-                else:
-                    bounding_box=self.iou_bounding_box(window_bounding_box,element_bounding_box)
-                    center = bounding_box.get_center()
-                    tree_node=TreeElementNode(**{
-                        'name':name,
-                        'control_type':node.LocalizedControlType.title(),
-                        'value':value,
-                        'shortcut':node.AcceleratorKey,
-                        'bounding_box':bounding_box,
-                        'center':center,
-                        'xpath':'',
-                        'app_name':app_name,
-                        'is_focused':is_focused
-                    })
-                    interactive_nodes.append(tree_node)
-            elif is_element_text(node):
-                dom_informative_nodes.append(TextElementNode(
-                    text=node.Name.strip(),
-                ))
-            
-            children=node.GetChildren()
-
-            # Recursively traverse the tree the right to left for normal apps and for DOM traverse from left to right
-            for child in (children if is_dom else children[::-1]):
-                # Incrementally building the xpath
-                
-                # Check if the child is a DOM element
-                if is_browser and child.AutomationId == "RootWebArea":
-                    bounding_box=child.BoundingRectangle
-                    self.dom_bounding_box=BoundingBox(left=bounding_box.left,top=bounding_box.top,
-                    right=bounding_box.right,bottom=bounding_box.bottom,width=bounding_box.width(),
-                    height=bounding_box.height())
-                    scroll_pattern=child.GetPattern(PatternId.ScrollPattern)
-                    self.dom_info=DOMInfo(
-                        horizontal_scrollable=scroll_pattern.HorizontallyScrollable,
-                        horizontal_scroll_percent=scroll_pattern.HorizontalScrollPercent if scroll_pattern.HorizontallyScrollable else 0,
-                        vertical_scrollable=scroll_pattern.VerticallyScrollable,
-                        vertical_scroll_percent=scroll_pattern.VerticalScrollPercent if scroll_pattern.VerticallyScrollable else 0
-                    )
-                    # enter DOM subtree
-                    tree_traversal(child, is_dom=True, is_dialog=is_dialog)
-                # Check if the child is a dialog
-                elif isinstance(child,WindowControl):
-                    if not child.IsOffscreen:
-                        if is_dom:
-                            bounding_box=child.BoundingRectangle
-                            if bounding_box.width() > 0.8*self.dom_bounding_box.width:
-                                # Because this window element covers the majority of the screen
-                                dom_interactive_nodes.clear()
-                        else:
-                            if is_window_modal(child):
-                                # Because this window element is modal
-                                interactive_nodes.clear()
-                    # enter dialog subtree
-                    tree_traversal(child, is_dom=is_dom, is_dialog=True)
-                else:
-                    # normal non-dialog children
-                    tree_traversal(child, is_dom=is_dom, is_dialog=is_dialog)
-
-        interactive_nodes, dom_interactive_nodes, scrollable_nodes, dom_informative_nodes = [], [], [], []
-        app_name=node.Name.strip()
-        match node.ClassName:
-            case "Progman":
-                app_name="Desktop"
-            case 'Shell_TrayWnd'|'Shell_SecondaryTrayWnd':
-                app_name="Taskbar"
-            case 'Microsoft.UI.Content.PopupWindowSiteBridge':
-                app_name="Context Menu"
-            case _:
-                pass
-        tree_traversal(node,is_dom=False,is_dialog=False)
-
-        logger.debug(f'Interactive nodes:{len(interactive_nodes)}')
-        logger.debug(f'DOM interactive nodes:{len(dom_interactive_nodes)}')
-        logger.debug(f'Scrollable nodes:{len(scrollable_nodes)}')
-
-        if use_dom:
-            if is_browser:
-                return (dom_interactive_nodes,scrollable_nodes,dom_informative_nodes)
-            else:
-                return ([],[],[])
-        else:
-            return (interactive_nodes+dom_interactive_nodes,scrollable_nodes,dom_informative_nodes)
-
-    def get_annotated_screenshot(self, nodes: list[TreeElementNode],scale:float=1.0) -> Image.Image:
-        screenshot = self.desktop.get_screenshot()
-        sleep(0.10)
-        
-        original_width = screenshot.width
-        original_height = screenshot.height
-
-        scaled_width = int(original_width * scale)
-        scaled_height = int(original_height * scale)
-        screenshot = screenshot.resize((scaled_width, scaled_height), Image.Resampling.LANCZOS)
-        
-        # Add padding
-        padding = 5
-        width = int(screenshot.width + (1.5 * padding))
-        height = int(screenshot.height + (1.5 * padding))
-        padded_screenshot = Image.new("RGB", (width, height), color=(255, 255, 255))
-        padded_screenshot.paste(screenshot, (padding, padding))
-
-        draw = ImageDraw.Draw(padded_screenshot)
-        font_size = 12
+    def get_window_element_from_element(self,element:uia.Control)->uia.Control|None:
+        while element is not None:
+            if uia.IsTopLevelWindow(element.NativeWindowHandle):
+                return element
+            element = element.GetParentControl()
+        return None
+    
+    def get_active_app(self)->App|None:
         try:
-            font = ImageFont.truetype('arial.ttf', font_size)
-        except IOError:
-            font = ImageFont.load_default()
-
-        def get_random_color():
-            return "#{:06x}".format(random.randint(0, 0xFFFFFF))
-
-        def draw_annotation(label, node: TreeElementNode):
-            box = node.bounding_box
-            color = get_random_color()
-
-            # Scale and pad the bounding box coordinates
-            adjusted_box = (
-                int(box.left * scale) + padding,
-                int(box.top * scale) + padding,
-                int(box.right * scale) + padding,
-                int(box.bottom * scale) + padding
+            handle=uia.GetForegroundWindow()
+            for app in self.get_apps():
+                if app.handle!=handle:
+                    continue
+                return app
+        except Exception as ex:
+            logger.error(f"Error in get_active_app: {ex}")
+        return None
+    
+    def get_app_status(self,control:uia.Control)->Status:
+        if uia.IsIconic(control.NativeWindowHandle):
+            return Status.MINIMIZED
+        elif uia.IsZoomed(control.NativeWindowHandle):
+            return Status.MAXIMIZED
+        elif uia.IsWindowVisible(control.NativeWindowHandle):
+            return Status.NORMAL
+        else:
+            return Status.HIDDEN
+    
+    def get_cursor_location(self)->tuple[int,int]:
+        position=pg.position()
+        return (position.x,position.y)
+    
+    def get_element_under_cursor(self)->uia.Control:
+        return uia.ControlFromCursor()
+    
+    def get_apps_from_start_menu(self)->dict[str,str]:
+        command='Get-StartApps | ConvertTo-Csv -NoTypeInformation'
+        apps_info,_=self.execute_command(command)
+        reader=csv.DictReader(io.StringIO(apps_info))
+        return {row.get('Name').lower():row.get('AppID') for row in reader}
+    
+    def execute_command(self,command:str)->tuple[str,int]:
+        try:
+            encoded = base64.b64encode(command.encode("utf-16le")).decode("ascii")
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-EncodedCommand', encoded], 
+                capture_output=True, 
+                errors='ignore',
+                timeout=25,
+                cwd=os.path.expanduser(path='~')
             )
-            # Draw bounding box
-            draw.rectangle(adjusted_box, outline=color, width=2)
+            stdout=result.stdout
+            stderr=result.stderr
+            return (stdout or stderr,result.returncode)
+        except subprocess.TimeoutExpired:
+            return ('Command execution timed out', 1)
+        except Exception as e:
+            return ('Command execution failed', 1)
+        
+    def is_app_browser(self,node:uia.Control):
+        process=Process(node.ProcessId)
+        return process.name() in BROWSER_NAMES
+    
+    def get_default_language(self)->str:
+        command="Get-Culture | Select-Object Name,DisplayName | ConvertTo-Csv -NoTypeInformation"
+        response,_=self.execute_command(command)
+        reader=csv.DictReader(io.StringIO(response))
+        return "".join([row.get('DisplayName') for row in reader])
+    
+    def resize_app(self,size:tuple[int,int]=None,loc:tuple[int,int]=None)->tuple[str,int]:
+        active_app=self.desktop_state.active_app
+        if active_app is None:
+            return "No active app found",1
+        if active_app.status==Status.MINIMIZED:
+            return f"{active_app.name} is minimized",1
+        elif active_app.status==Status.MAXIMIZED:
+            return f"{active_app.name} is maximized",1
+        else:
+            app_control=uia.ControlFromHandle(active_app.handle)
+            if loc is None:
+                x=app_control.BoundingRectangle.left
+                y=app_control.BoundingRectangle.top
+                loc=(x,y)
+            if size is None:
+                width=app_control.BoundingRectangle.width()
+                height=app_control.BoundingRectangle.height()
+                size=(width,height)
+            x,y=loc
+            width,height=size
+            app_control.MoveWindow(x,y,width,height)
+            return (f'{active_app.name} resized to {width}x{height} at {x},{y}.',0)
+    
+    def is_app_running(self,name:str)->bool:
+        apps={app.name:app for app in self.get_apps()}
+        return process.extractOne(name,list(apps.keys()),score_cutoff=60) is not None
+    
+    def app(self,mode:Literal['launch','switch','resize'],name:Optional[str]=None,loc:Optional[tuple[int,int]]=None,size:Optional[tuple[int,int]]=None):
+        match mode:
+            case 'launch':
+                response,status=self.launch_app(name)
+                sleep(1.25)
+                if status!=0:
+                    return response
+                consecutive_waits=10
+                for _ in range(consecutive_waits):
+                    if not self.is_app_running(name):
+                        sleep(1.25)
+                    else:
+                        return f'{name.title()} launched.'
+                return f'Launching {name.title()} wait for it to come load.'
+            case 'resize':
+                response,status=self.resize_app(size=size,loc=loc)
+                if status!=0:
+                    return response
+                else:
+                    return response
+            case 'switch':
+                response,status=self.switch_app(name)
+                if status!=0:
+                    return response
+                else:
+                    return response
+        
+    def launch_app(self,name:str)->tuple[str,int]:
+        apps_map=self.get_apps_from_start_menu()
+        matched_app=process.extractOne(name,apps_map.keys(),score_cutoff=70)
+        if matched_app is None:
+            return (f'{name.title()} not found in start menu.',1)
+        app_name,_=matched_app
+        appid=apps_map.get(app_name)
+        if appid is None:
+            return (f'{name.title()} not found in start menu.',1)
+        if appid.endswith('.exe'):
+            command=f"Start-Process '{appid}'"
+        else:
+            command=f"Start-Process shell:AppsFolder\\{appid}"
+        response,status=self.execute_command(command)
+        return response,status
+    
+    def switch_app(self,name:str):
+        apps={app.name:app for app in [self.desktop_state.active_app]+self.desktop_state.apps if app is not None}
+        matched_app:Optional[tuple[str,float]]=process.extractOne(name,list(apps.keys()),score_cutoff=70)
+        if matched_app is None:
+            return (f'Application {name.title()} not found.',1)
+        app_name,_=matched_app
+        app=apps.get(app_name)
+        target_handle=app.handle
 
-            # Label dimensions
-            label_width = draw.textlength(str(label), font=font)
-            label_height = font_size
-            left, top, right, bottom = adjusted_box
+        if uia.IsIconic(target_handle):
+            uia.ShowWindow(target_handle, win32con.SW_RESTORE)
+            content=f'{app_name.title()} restored from Minimized state.'
+        else:
+            self.bring_window_to_top(target_handle)
+            content=f'Switched to {app_name.title()} window.'
+        return content,0
+    
+    def bring_window_to_top(self,target_handle:int):
+        foreground_handle=win32gui.GetForegroundWindow()
+        foreground_thread,_=win32process.GetWindowThreadProcessId(foreground_handle)
+        target_thread,_=win32process.GetWindowThreadProcessId(target_handle)
+        try:
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)
+            win32process.AttachThreadInput(foreground_thread,target_thread,True)
+            win32gui.SetForegroundWindow(target_handle)
+            win32gui.BringWindowToTop(target_handle)
+        except Exception as e:
+            logger.error(f'Failed to bring window to top: {e}')
+        finally:
+            win32process.AttachThreadInput(foreground_thread,target_thread,False)
+    
+    def get_element_handle_from_label(self,label:int)->uia.Control:
+        tree_state=self.desktop_state.tree_state
+        element_node=tree_state.interactive_nodes[label]
+        xpath=element_node.xpath
+        element_handle=self.get_element_from_xpath(xpath)
+        return element_handle
+    
+    def get_coordinates_from_label(self,label:int)->tuple[int,int]:
+        element_handle=self.get_element_handle_from_label(label)
+        bounding_rectangle=element_handle.BoundingRectangle
+        return bounding_rectangle.xcenter(),bounding_rectangle.ycenter()
+        
+    def click(self,loc:tuple[int,int],button:str='left',clicks:int=2):
+        x,y=loc
+        pg.click(x,y,button=button,clicks=clicks,duration=0.1)
 
-            # Label position above bounding box
-            label_x1 = right - label_width
-            label_y1 = top - label_height - 4
-            label_x2 = label_x1 + label_width
-            label_y2 = label_y1 + label_height + 4
+    def type(self,loc:tuple[int,int],text:str,caret_position:Literal['start','end','none']='none',clear:Literal['true','false']='false',press_enter:Literal['true','false']='false'):
+        x,y=loc
+        pg.leftClick(x,y)
+        if caret_position == 'start':
+            pg.press('home')
+        elif caret_position == 'end':
+            pg.press('end')
+        else:
+            pass
+        if clear=='true':
+            pg.sleep(0.5)
+            pg.hotkey('ctrl','a')
+            pg.press('backspace')
+        pg.typewrite(text,interval=0.02)
+        if press_enter=='true':
+            pg.press('enter')
 
-            # Draw label background and text
-            draw.rectangle([(label_x1, label_y1), (label_x2, label_y2)], fill=color)
-            draw.text((label_x1 + 2, label_y1 + 2), str(label), fill=(255, 255, 255), font=font)
+    def scroll(self,loc:tuple[int,int]=None,type:Literal['horizontal','vertical']='vertical',direction:Literal['up','down','left','right']='down',wheel_times:int=1)->str|None:
+        if loc:
+            self.move(loc)
+        match type:
+            case 'vertical':
+                match direction:
+                    case 'up':
+                        uia.WheelUp(wheel_times)
+                    case 'down':
+                        uia.WheelDown(wheel_times)
+                    case _:
+                        return 'Invalid direction. Use "up" or "down".'
+            case 'horizontal':
+                match direction:
+                    case 'left':
+                        pg.keyDown('Shift')
+                        pg.sleep(0.05)
+                        uia.WheelUp(wheel_times)
+                        pg.sleep(0.05)
+                        pg.keyUp('Shift')
+                    case 'right':
+                        pg.keyDown('Shift')
+                        pg.sleep(0.05)
+                        uia.WheelDown(wheel_times)
+                        pg.sleep(0.05)
+                        pg.keyUp('Shift')
+                    case _:
+                        return 'Invalid direction. Use "left" or "right".'
+            case _:
+                return 'Invalid type. Use "horizontal" or "vertical".'
+        return None
+    
+    def drag(self,loc:tuple[int,int]):
+        x,y=loc
+        pg.sleep(0.5)
+        pg.dragTo(x,y,duration=0.6)
 
-        # Draw annotations in parallel
-        with ThreadPoolExecutor() as executor:
-            executor.map(draw_annotation, range(len(nodes)), nodes)
-        return padded_screenshot
+    def move(self,loc:tuple[int,int]):
+        x,y=loc
+        pg.moveTo(x,y,duration=0.1)
+
+    def shortcut(self,shortcut:str):
+        shortcut=shortcut.split('+')
+        if len(shortcut)>1:
+            pg.hotkey(*shortcut)
+        else:
+            pg.press(''.join(shortcut))
+
+    def multi_select(self,press_ctrl:Literal['true','false']='false',elements:list[tuple[int,int]|int]=[]):
+        if press_ctrl=='true':
+            pg.keyDown('ctrl')
+        for element in elements:
+            x,y=element
+            pg.click(x,y,duration=0.2)
+            pg.sleep(0.5)
+        pg.keyUp('ctrl')
+    
+    def multi_edit(self,elements:list[tuple[int,int,str]|tuple[int,str]]):
+        for element in elements:
+            x,y,text=element
+            self.type((x,y),text=text,clear='true')
+    
+    def scrape(self,url:str)->str:
+        response=requests.get(url,timeout=10)
+        html=response.text
+        content=markdownify(html=html)
+        return content
+    
+    def get_app_size(self,control:uia.Control):
+        window=control.BoundingRectangle
+        if window.isempty():
+            return Size(width=0,height=0)
+        return Size(width=window.width(),height=window.height())
+    
+    def is_app_visible(self,app)->bool:
+        is_minimized=self.get_app_status(app)!=Status.MINIMIZED
+        size=self.get_app_size(app)
+        area=size.width*size.height
+        is_overlay=self.is_overlay_app(app)
+        return not is_overlay and is_minimized and area>10
+    
+    def is_overlay_app(self,element:uia.Control) -> bool:
+        no_children = len(element.GetChildren()) == 0
+        is_name = "Overlay" in element.Name.strip()
+        return no_children or is_name
+        
+    def get_apps(self) -> list[App]:
+        try:
+            desktop = uia.GetRootControl()  # Get the desktop control
+            children = desktop.GetChildren()
+            apps = []
+            for depth, child in enumerate(children):
+                if isinstance(child,(uia.WindowControl,uia.PaneControl)):
+                    window_pattern=child.GetPattern(uia.PatternId.WindowPattern)
+                    if (window_pattern is None):
+                        continue
+                    if window_pattern.CanMinimize and window_pattern.CanMaximize:
+                        status = self.get_app_status(child)
+                        size=self.get_app_size(child)
+                        apps.append(App(**{
+                            "name":child.Name,
+                            "depth":depth,
+                            "status":status,
+                            "size":size,
+                            "handle":child.NativeWindowHandle,
+                            "process_id":child.ProcessId
+                        }))
+        except Exception as ex:
+            logger.error(f"Error in get_apps: {ex}")
+            apps = []
+        return apps
+    
+    def get_xpath_from_element(self,element:uia.Control):
+        current=element
+        if current is None:
+            return ""
+        path_parts=[]
+        while current is not None:
+            parent=current.GetParentControl()
+            if parent is None:
+                # we are at the root node
+                path_parts.append(f'{current.ControlTypeName}')
+                break
+            children=parent.GetChildren()
+            same_type_children=["-".join(map(lambda x:str(x),child.GetRuntimeId())) for child in children if child.ControlType==current.ControlType]
+            index=same_type_children.index("-".join(map(lambda x:str(x),current.GetRuntimeId())))
+            if same_type_children:
+                path_parts.append(f'{current.ControlTypeName}[{index+1}]')
+            else:
+                path_parts.append(f'{current.ControlTypeName}')
+            current=parent
+        path_parts.reverse()
+        xpath="/".join(path_parts)
+        return xpath
+
+    def get_element_from_xpath(self,xpath:str)->uia.Control:
+        pattern = re.compile(r'(\w+)(?:\[(\d+)\])?')
+        parts=xpath.split("/")
+        root=uia.GetRootControl()
+        element=root
+        for part in parts[1:]:
+            match=pattern.fullmatch(part)
+            if match is None:
+                continue
+            control_type, index=match.groups()
+            index=int(index) if index else None
+            children=element.GetChildren()
+            same_type_children=list(filter(lambda x:x.ControlTypeName==control_type,children))
+            if index:
+                element=same_type_children[index-1]
+            else:
+                element=same_type_children[0]
+        return element
+    
+    def get_windows_version(self)->str:
+        response,status=self.execute_command("(Get-CimInstance Win32_OperatingSystem).Caption")
+        if status==0:
+            return response.strip()
+        return "Windows"
+    
+    def get_user_account_type(self)->str:
+        response,status=self.execute_command("(Get-LocalUser -Name $env:USERNAME).PrincipalSource")
+        return "Local Account" if response.strip()=='Local' else "Microsoft Account" if status==0 else "Local Account"
+    
+    def get_dpi_scaling(self):
+        user32 = ctypes.windll.user32
+        dpi = user32.GetDpiForSystem()
+        return dpi / 96.0
+    
+    def get_screen_size(self)->Size:
+        width, height = uia.GetScreenSize()
+        return Size(width=width,height=height)
+
+    def get_screenshot(self)->Image.Image:
+        return pg.screenshot()
+    
+    @contextmanager
+    def auto_minimize(self):
+        try:
+            handle = uia.GetForegroundWindow()
+            uia.ShowWindow(handle, win32con.SW_MINIMIZE)
+            yield
+        finally:
+            uia.ShowWindow(handle, win32con.SW_RESTORE)

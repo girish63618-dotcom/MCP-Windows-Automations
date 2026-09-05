@@ -1,51 +1,21 @@
-INTERACTIVE_CONTROL_TYPE_NAMES=set([
-    'ButtonControl',
-    'ListItemControl',
-    'MenuItemControl',
-    'EditControl',
-    'CheckBoxControl',
-    'RadioButtonControl',
-    'ComboBoxControl',
-    'HyperlinkControl',
-    'SplitButtonControl',
-    'TabItemControl',
-    'TreeItemControl',
-    'DataItemControl',
-    'HeaderItemControl',
-    'TextBoxControl',
-    'SpinnerControl',
-    'ScrollBarControl'
+from typing import Set
+
+BROWSER_NAMES=set([
+    'msedge.exe',
+    'chrome.exe',
+    'firefox.exe'
 ])
 
-DOCUMENT_CONTROL_TYPE_NAMES=set([
-    'DocumentControl'
+AVOIDED_APPS:Set[str]=set([
+    'AgentUI'
 ])
 
-STRUCTURAL_CONTROL_TYPE_NAMES = set([
-    'PaneControl',
-    'GroupControl',
-    'CustomControl'
+EXCLUDED_APPS:Set[str]=set([
+    'Progman',
+    'Shell_TrayWnd',
+    'Shell_SecondaryTrayWnd',
+    'Microsoft.UI.Content.PopupWindowSiteBridge',
+    'Windows.UI.Core.CoreWindow',
 ])
 
-INFORMATIVE_CONTROL_TYPE_NAMES=set([
-    'TextControl',
-    'ImageControl',
-    'StatusBarControl',
-    # 'ProgressBarControl',
-    # 'ToolTipControl',
-    # 'TitleBarControl',
-    # 'SeparatorControl',
-    # 'HeaderControl',
-    # 'HeaderItemControl',
-])
-
-DEFAULT_ACTIONS=set([
-    'Click',
-    'Press',
-    'Jump',
-    'Check',
-    'Uncheck',
-    'Double Click'
-])
-
-THREAD_MAX_RETRIES = 3
+PROCESS_PER_MONITOR_DPI_AWARE = 2
